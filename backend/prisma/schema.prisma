@@ -1,0 +1,916 @@
+// Aurélie — PostgreSQL schema (Prisma)
+//
+// Ported 1:1 from the previous Mongoose models. Design notes:
+//
+// * Every model keeps a STRING primary key (uuid) rather than an auto-increment
+//   int, because the frontend and the existing API contract treat `id` as an
+//   opaque string (it used to be a Mongo ObjectId). Nothing outside this file
+//   had to change.
+// * Mongo's embedded arrays (Cart.items, Order.items, Wishlist.products)
+//   become real child tables. The routes reassemble them into the exact same
+//   JSON shape the frontend already consumes.
+// * Genuinely schemaless blobs (User.preferences, Order.shippingAddress,
+//   AIRecommendation.prefs, Product.tryOnAsset) stay as `Json`, which is what
+//   Schema.Types.Mixed was doing anyway.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Product {
+  id   String @id @default(uuid())
+  name String
+
+  // The store was earring-only when `category` (stud/hoop/jhumka/...) and
+  // `kind` (silhouette within that category) were designed. Rather than
+  // repurpose those fields for a meaning they weren't built for, productType
+  // sits above them as the real top-level axis: which kind of jewelry this
+  // is. `category` stays what it always was — a subcategory *within* a
+  // productType (earring shapes for "earrings", chain styles for
+  // "necklace", etc.) — so nothing that already filters by `category`
+  // breaks; it just needs pairing with productType to stay unambiguous
+  // across types now that categories aren't earring-only.
+  productType String @default("earrings") // earrings | necklace | bracelet | ring | anklet
+  category    String
+  material    String?
+  color       String?
+  stone       String?  @default("—")
+  style       String?
+  occasion    String[] @default([])
+  price       Float
+  originalPrice  Float?
+  rating         Float    @default(4.5)
+  reviews        Int      @default(0)
+  stock          Int      @default(10)
+  tags           String[] @default([])
+  kind           String   @default("stud")
+  // Face-shape matching only makes sense for jewelry worn at/near the face
+  // (earrings, necklaces). Left empty for bracelets/rings/anklets rather
+  // than populated with a guess — there's no honest face-shape signal for
+  // something worn on a wrist or finger.
+  faceShapeMatch String[] @default([])
+  description    String?
+  dimensions     String   @default("2.2cm x 0.8cm")
+  weight         String   @default("3.1g")
+
+  // { front, transparent, left, right } — all nullable, same shape as before.
+  tryOnAsset Json @default("{\"front\":null,\"transparent\":null,\"left\":null,\"right\":null}")
+
+  // Real catalog photography — distinct from tryOnAsset above, which is only
+  // ever used for the camera overlay. Empty by default: there is no seeded
+  // photography in this project, and the storefront must show the existing
+  // EarringArt illustration as an honest placeholder rather than a
+  // fabricated photo until an admin actually attaches real image URLs (see
+  // AdminProductForm in frontend/src/App.jsx). Actual file upload/object
+  // storage is out of scope here, same as Review.images below — these are
+  // URLs an admin pastes in, not uploads this server hosts. See
+  // prisma/product_images_migration.sql for the standalone SQL version of
+  // this pair of columns, for anyone applying this by hand instead of via
+  // `prisma migrate dev`.
+  images            String[] @default([])
+  primaryImageIndex Int      @default(0)
+
+  approvalStatus    ProductApprovalStatus @default(APPROVED)
+  isPublished       Boolean               @default(true)
+  sellerId          String?
+  sku               String?
+
+  defaultScale   Float @default(1)
+  defaultOffsetX Float @default(0)
+  defaultOffsetY Float @default(0)
+
+  // --- Phase 1: product discovery / trend scoring -------------------------
+  // Cached, not computed per-request. Refreshed by `npm run recalc-trends`
+  // (src/jobs/recalcTrends.js). Starts at 0 for every product — there is no
+  // seed data for views/orders/wishlists, so a brand-new catalogue has no
+  // trend signal yet, on purpose. Nothing here is fabricated.
+  trendScore         Float     @default(0)
+  // The score from the previous recalculation run. "Rising Fast" is a tag
+  // derived from (trendScore - trendScorePrevious), not from trendScore
+  // alone — a product can be popular without currently accelerating.
+  trendScorePrevious Float     @default(0)
+  // Per-signal breakdown behind the single trendScore number — what each
+  // signal contributed, before and after decay — so "why is this trending"
+  // is answerable (surfaced on GET /api/products/demand) instead of opaque.
+  trendScoreBreakdown Json?
+  trendScoreComputedAt DateTime?
+
+  // Manually curated by an admin — there is no signal in the data that could
+  // honestly produce "Editor's Pick", so unlike every other discovery tag
+  // this one is a flag, not a score.
+  isEditorsPick Boolean @default(false)
+
+  // --- Phase 2: full-text search --------------------------------------
+  // A Postgres GENERATED ALWAYS AS ... STORED column — Prisma's schema
+  // language has no way to express the generation expression, so it's
+  // declared here only as Unsupported(), which tells Prisma the column
+  // exists and to leave it alone rather than trying to drop it as unknown
+  // drift. The actual column + its GIN index are created by raw SQL: see
+  // prisma/init.sql (bundled into the full schema) and
+  // prisma/fts_migration.sql (a standalone snippet for anyone using
+  // `prisma migrate dev` instead of init.sql — that command can't create a
+  // generated column either, so this one step has to be run by hand either
+  // way). Queried via $queryRaw in routes/products.js, never through the
+  // typed Prisma client — Unsupported columns aren't queryable that way.
+  searchVector Unsupported("tsvector")?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  cartItems         CartItem[]
+  wishlistItems     WishlistItem[]
+  reviewEntries     Review[]
+  productViews      ProductView[]
+  tryOnSessions     TryOnSession[]
+  tryOnEvents       TryOnEvent[]
+  searchImpressions ProductSearchImpression[]
+  aiRecommendations AIRecommendation[]
+
+  @@index([category])
+  @@index([productType])
+  @@index([productType, category])
+  @@index([price])
+  @@index([rating])
+}
+
+model Category {
+  id        String   @id @default(uuid())
+  slug      String   @unique
+  name      String
+  // Which product type this subcategory belongs to (earrings/necklace/
+  // bracelet/ring/anklet). Slugs stay globally unique (e.g. "chain-necklace"
+  // vs. earrings' "stud") so /api/categories/:slug and the frontend's
+  // existing calls don't need a second identifier added to every route.
+  productType String @default("earrings")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([productType])
+}
+
+model User {
+  id   String @id @default(uuid())
+  name String
+  email String @unique
+
+  // Nullable because a Google-only account (routes/auth.js POST /google,
+  // case 3) never has a password — they authenticate via Google every time.
+  // An email/password account still always has this set; a Google account
+  // that later sets a password would too, though nothing in this app does
+  // that yet.
+  passwordHash String?
+
+  // Google's "sub" claim from a verified ID token — the stable, unique
+  // identifier for a Google account (unlike email, which a Google account
+  // could theoretically change). Null for accounts that have never signed
+  // in with Google. Nullable + @unique lets any number of rows share
+  // `null` (Postgres treats NULLs as distinct in a unique index) while
+  // still guaranteeing at most one User per real Google account.
+  googleId String? @unique
+
+  // Never settable from a request body directly — only via the seed script
+  // (one bootstrap SUPER_ADMIN) or PATCH /api/admin/users/:id/role, which is
+  // itself SUPER_ADMIN-gated. routes/auth.js's register endpoint hardcodes
+  // new accounts to CUSTOMER regardless of what a client sends, and so does
+  // POST /google — see routes/auth.js for both.
+  role UserRole @default(CUSTOMER)
+
+  // { style, color, occasion, faceShape, priceMin, priceMax }
+  preferences Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  sellerProfile       SellerProfile?
+  authTokens          AuthToken[]
+  deliveryProfile     DeliveryProfile?
+  assignedDeliveries  DeliveryAssignment[] @relation("AssignedDeliveries")
+  deliveredProofs     DeliveryProof[]      @relation("DeliveredProofs")
+  assignedOrders      Order[]              @relation("OrderDeliveryPerson")
+  notifications       Notification[]
+  providedServices    Service[]            @relation("ProviderServices")
+
+  @@index([role])
+}
+
+enum UserRole {
+  SUPER_ADMIN
+  ADMIN
+  PRODUCT_MANAGER
+  ORDER_MANAGER
+  CUSTOMER_SUPPORT
+  CUSTOMER
+  SELLER
+  DELIVERY_BOY
+}
+
+model Cart {
+  // Either a User.id or the frontend's X-Guest-Id value.
+  ownerKey  String     @id
+  items     CartItem[]
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+}
+
+model CartItem {
+  id           String  @id @default(uuid())
+  cartOwnerKey String
+  productId    String
+  qty          Int      @default(1)
+  createdAt    DateTime @default(now())
+
+  cart    Cart    @relation(fields: [cartOwnerKey], references: [ownerKey], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([cartOwnerKey, productId])
+  @@index([cartOwnerKey])
+  // Trend scoring reads "cart adds in the last N days" per product — this
+  // composite index is what makes that a range scan instead of a full scan.
+  // Caveat documented in trendService.js: adding an already-present item
+  // increments qty rather than inserting a new row, so this measures
+  // distinct cart adds, not repeat adds.
+  @@index([productId, createdAt])
+}
+
+model Wishlist {
+  ownerKey  String         @id
+  items     WishlistItem[]
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+}
+
+model WishlistItem {
+  id               String   @id @default(uuid())
+  wishlistOwnerKey String
+  productId        String
+  createdAt        DateTime @default(now())
+
+  wishlist Wishlist @relation(fields: [wishlistOwnerKey], references: [ownerKey], onDelete: Cascade)
+  product  Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([wishlistOwnerKey, productId])
+  @@index([wishlistOwnerKey])
+  @@index([productId, createdAt])
+}
+
+model Order {
+  id              String         @id @default(uuid())
+  orderNumber     String?        @unique
+  ownerKey        String
+  items           OrderItem[]
+
+  subtotal        Float?
+  tax             Float?         @default(0)
+  discount        Float          @default(0)
+  shipping        Float          @default(0)
+  total           Float?
+
+  shippingAddress Json?
+  paymentMethod   String?
+  paymentStatus   PaymentStatus  @default(PENDING)
+  status          OrderStatus    @default(Pending)
+  deliveryStatus  DeliveryStatus @default(UNASSIGNED)
+
+  deliveryPersonId String?
+  deliveryOtp      String?
+  assignedAt       DateTime?
+  deliveredAt      DateTime?
+  deliveryNotes    String?
+  cancelReason     String?
+  isReturnRequested Boolean      @default(false)
+  returnReason     String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  deliveryPerson       User?                @relation("OrderDeliveryPerson", fields: [deliveryPersonId], references: [id], onDelete: SetNull)
+  statusHistory        OrderStatusHistory[]
+  deliveryAssignments  DeliveryAssignment[]
+  deliveryProof        DeliveryProof?
+  reviews              Review[]
+
+  @@index([ownerKey])
+  @@index([deliveryPersonId])
+  @@index([status])
+  @@index([deliveryStatus])
+  @@index([paymentStatus])
+}
+
+model OrderItem {
+  id      String @id @default(uuid())
+  orderId String
+
+  productId         String
+  sellerId          String?
+  name              String?
+  price             Float?
+  qty               Int?
+  position          Int     @default(0)
+  isReviewed        Boolean @default(false)
+  fulfillmentStatus String? @default("UNFULFILLED")
+
+  createdAt DateTime @default(now())
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@index([productId, createdAt])
+  @@index([sellerId])
+}
+
+enum OrderStatus {
+  Pending
+  Processing
+  Shipped
+  Delivered
+  Cancelled
+}
+
+enum PaymentStatus {
+  PENDING
+  PENDING_PAYMENT
+  PAID
+  FAILED
+  REFUNDED
+}
+
+enum DeliveryStatus {
+  UNASSIGNED
+  ASSIGNED
+  PICKED_UP
+  OUT_FOR_DELIVERY
+  DELIVERED
+  FAILED
+  CANCELLED
+}
+
+model Review {
+  id        String  @id @default(uuid())
+  productId String
+  ownerKey  String
+  rating    Int
+  title     String?
+  comment   String?
+  // URLs only — actual image upload/storage is out of scope here (see
+  // "Next steps for production" in README: object storage for uploads).
+  images String[] @default([])
+
+  // Set server-side only, from a real Delivered/paid order lookup — never
+  // trusted from client input. See services/reviewService.js.
+  verifiedPurchase Boolean @default(false)
+
+  // Cached counters, kept in sync with the ReviewHelpfulVote/ReviewReport
+  // tables in a transaction (see routes/reviews.js) rather than computed
+  // live on every read — reviews are read far more often than voted on.
+  helpfulCount Int @default(0)
+  reportCount  Int @default(0)
+
+  moderationStatus ReviewModerationStatus @default(Approved)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  product       Product             @relation(fields: [productId], references: [id], onDelete: Cascade)
+  orderId       String?
+  order         Order?              @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  helpfulVotes  ReviewHelpfulVote[]
+  reports       ReviewReport[]
+
+  // One review per product per person — the spec's "prevent abuse of review
+  // submission" starting point. Applies to guests (X-Guest-Id) the same way
+  // it applies to logged-in users, consistent with how this app already
+  // scopes cart/wishlist ownership.
+  @@unique([productId, ownerKey])
+  @@index([productId])
+  @@index([orderId])
+  @@index([productId, createdAt])
+  @@index([productId, moderationStatus])
+}
+
+enum ReviewModerationStatus {
+  Approved // visible by default — see reviewService.js for why this isn't Pending
+  Flagged  // auto-set once reportCount crosses a threshold; hidden from public listing/rating
+  Rejected // set by an admin action; hidden from public listing/rating
+}
+
+// Idempotency for "helpful" votes: one per person per review. Without this,
+// nothing stops the same guest id from voting the same review helpful
+// repeatedly to inflate its rank.
+model ReviewHelpfulVote {
+  id        String   @id @default(uuid())
+  reviewId  String
+  ownerKey  String
+  createdAt DateTime @default(now())
+
+  review Review @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+
+  @@unique([reviewId, ownerKey])
+  @@index([reviewId])
+}
+
+// Same idempotency reasoning as ReviewHelpfulVote, for reports.
+model ReviewReport {
+  id        String   @id @default(uuid())
+  reviewId  String
+  ownerKey  String
+  reason    String?
+  createdAt DateTime @default(now())
+
+  review Review @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+
+  @@unique([reviewId, ownerKey])
+  @@index([reviewId])
+}
+
+model AIRecommendation {
+  id        String   @id @default(uuid())
+  ownerKey  String   @default("guest")
+  productId String
+  score     Float?
+
+  // Snapshot of { faceShape, style, occasion, color, minPrice, maxPrice }
+  // that produced the score.
+  prefs Json?
+
+  // Phase 3: the human-readable reason list recommendationEngine.js
+  // produced for this specific score — persisted, not just returned in the
+  // API response, so "why was this recommended" is answerable later (an
+  // audit trail, or a future "why am I seeing this" UI), not only at
+  // request time.
+  reasons Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId])
+}
+
+model TryOnSession {
+  id        String     @id @default(uuid())
+  ownerKey  String     @default("guest")
+  productId String
+  mode      TryOnMode
+  converted Boolean    @default(false)
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  product Product      @relation(fields: [productId], references: [id], onDelete: Cascade)
+  events  TryOnEvent[]
+
+  @@index([productId])
+  @@index([productId, createdAt])
+}
+
+// Phase 8 — the real event stream the spec asked for, replacing the old
+// single `converted` boolean's coarse "did they eventually add to cart"
+// signal with the actual sequence of what happened during a try-on.
+// sessionId is nullable because "opened" can happen before a session
+// exists — see routes/tryon.js: a session starts on the first real camera
+// grant or upload, but the modal opening itself is worth logging even if
+// the person closes it without ever reaching that point (a real funnel
+// needs the top of the funnel, not just the parts that became a session).
+model TryOnEvent {
+  id        String        @id @default(uuid())
+  sessionId String?
+  ownerKey  String        @default("guest")
+  productId String
+  eventType TryOnEventType
+  // Small, event-specific extra data — e.g. { toProductId } for
+  // product_changed, { orderId } for purchase. Optional and deliberately
+  // unstructured per event type rather than adding a column per event.
+  metadata Json?
+  createdAt DateTime      @default(now())
+
+  session TryOnSession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+  product Product        @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId])
+  @@index([productId, eventType])
+  @@index([createdAt])
+}
+
+enum TryOnEventType {
+  opened
+  started
+  product_changed
+  screenshot
+  wishlist
+  add_to_cart
+  checkout
+  purchase
+}
+
+enum TryOnMode {
+  camera
+  upload
+}
+
+model ProductView {
+  id        String   @id @default(uuid())
+  ownerKey  String   @default("guest")
+  productId String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId])
+  @@index([productId, createdAt])
+}
+
+// One row per product that appears in a search result set, capped to the
+// top 20 matches per search (see routes/products.js) so a broad query can't
+// write hundreds of rows. This is the "search activity" trend signal — how
+// often a product surfaces for real user queries, not just how often its
+// page is opened.
+model ProductSearchImpression {
+  id        String   @id @default(uuid())
+  productId String
+  query     String
+  createdAt DateTime @default(now())
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId, createdAt])
+}
+
+// Phase 5 — RBAC audit trail. Append-only by design: no route ever updates
+// or deletes a row here (see routes/admin.js) — an audit log that could be
+// edited by the same admins it's supposed to hold accountable isn't a real
+// audit log. Written by services/auditLog.js after every admin mutation
+// (product/category writes, order status changes, review moderation, role
+// changes), never by a route directly, so the "what fields get logged"
+// question has one answer instead of N slightly-different ones.
+model AuditLog {
+  id String @id @default(uuid())
+
+  // Who performed the action, and what role they held AT THE TIME — roles
+  // can change later, so this is a snapshot, not a live reference.
+  actorOwnerKey String
+  actorRole     UserRole
+
+  action     String // e.g. "product.update", "review.moderate", "user.role.change"
+  targetType String // e.g. "Product", "Review", "User"
+  targetId   String
+
+  // Snapshots of the affected record before/after the change, where
+  // meaningful (a delete has `before` and no `after`; a create has `after`
+  // and no `before`).
+  before Json?
+  after  Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([targetType, targetId])
+  @@index([createdAt])
+  @@index([actorOwnerKey])
+}
+
+// Phase 5 — real site-wide settings, SUPER_ADMIN-editable. Starts with the
+// values that used to be hardcoded in routes/orders.js (free-shipping
+// threshold, shipping rate) — a genuine example of a "Settings" screen
+// doing something real, not a placeholder toggle with no effect.
+model SiteSetting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+  updatedBy String? // ownerKey of the admin who last changed it
+}
+
+// Phase 7 — real face-shape detection log. Detection itself runs
+// client-side (frontend/src/services/faceShapeDetection.js, MediaPipe Face
+// Landmarker) since that's where the camera/photo is; this table is the
+// server-side record of real detection events, so "how many real
+// detections happened, at what confidence, with what distribution of
+// results" is answerable from actual usage — distinct from
+// GET /api/admin/analytics/face-shape-popularity, which counts face shapes
+// that were inputs to a recommendation, not raw detection events.
+//
+// Landmarks are deliberately NOT stored here (478 points per detection
+// would bloat this table fast for no functional benefit today) — only the
+// classification result. If a future need arises (retraining, debugging a
+// specific bad classification), the frontend already has the full landmark
+// array in memory at detection time; store it then, not by default here.
+model FaceShapeDetection {
+  id         String   @id @default(uuid())
+  ownerKey   String   @default("guest")
+  faceShape  String
+  confidence Float
+  // Which detector produced this — the whole point of isolating the CV
+  // provider behind a service boundary (see faceShapeDetection.js's file
+  // header) is that this can change later without changing the API
+  // contract; recording it here means a future provider swap is visible in
+  // the data, not just in code history.
+  source    String @default("mediapipe-client")
+  createdAt DateTime @default(now())
+
+  @@index([ownerKey])
+  @@index([createdAt])
+}
+
+enum ProductApprovalStatus {
+  DRAFT
+  PENDING_APPROVAL
+  APPROVED
+  REJECTED
+  ARCHIVED
+}
+
+enum SellerStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  SUSPENDED
+}
+
+enum AuthTokenType {
+  PASSWORD_RESET
+  EMAIL_VERIFY
+}
+
+model SellerProfile {
+  id              String       @id @default(uuid())
+  userId          String       @unique
+  storeName       String
+  slug            String       @unique
+  description     String?
+  logoUrl         String?
+  bannerUrl       String?
+  contactEmail    String?
+  contactPhone    String?
+  status          SellerStatus @default(PENDING)
+  commissionRate  Float        @default(10.0)
+  payoutDetails   Json?
+  rejectionReason String?
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Banner {
+  id        String   @id @default(uuid())
+  imageUrl  String
+  title     String
+  subtitle  String?
+  linkUrl   String?
+  active    Boolean  @default(true)
+  position  Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model ImageAsset {
+  key       String   @id
+  mime      String
+  size      Int
+  data      Bytes
+  createdAt DateTime @default(now())
+}
+
+model AuthToken {
+  id        String        @id @default(uuid())
+  userId    String
+  tokenHash String        @unique
+  type      AuthTokenType
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime      @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model RevokedToken {
+  jti       String   @id
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+}
+
+enum DeliveryBoyStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  SUSPENDED
+}
+
+model DeliveryProfile {
+  id              String            @id @default(uuid())
+  userId          String            @unique
+  phone           String?
+  assignedArea    String?
+  vehicleType     String?
+  idDocumentUrl   String?
+  status          DeliveryBoyStatus @default(PENDING)
+  isAvailable     Boolean           @default(true)
+  rejectionReason String?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model DeliveryAssignment {
+  id               String         @id @default(uuid())
+  orderId          String
+  deliveryPersonId String
+  assignedById     String?
+  status           DeliveryStatus @default(ASSIGNED)
+  assignedAt       DateTime       @default(now())
+  pickedUpAt       DateTime?
+  deliveredAt      DateTime?
+  failedAt         DateTime?
+  failureReason    String?
+  notes            String?
+  otpVerified      Boolean        @default(false)
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  order          Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  deliveryPerson User  @relation("AssignedDeliveries", fields: [deliveryPersonId], references: [id], onDelete: Cascade)
+
+  @@index([deliveryPersonId])
+  @@index([orderId])
+}
+
+model DeliveryProof {
+  id                 String   @id @default(uuid())
+  orderId            String   @unique
+  deliveryPersonId   String
+  recipientName      String?
+  otpUsed            String?
+  photoUrl           String?
+  signatureUrl       String?
+  timestamp          DateTime @default(now())
+  notes              String?
+  cashCollected      Float?
+  isPaymentConfirmed Boolean  @default(true)
+  createdAt          DateTime @default(now())
+
+  order          Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  deliveryPerson User  @relation("DeliveredProofs", fields: [deliveryPersonId], references: [id], onDelete: Cascade)
+}
+
+model OrderStatusHistory {
+  id             String          @id @default(uuid())
+  orderId        String
+  previousStatus OrderStatus?
+  newStatus      OrderStatus
+  deliveryStatus DeliveryStatus?
+  paymentStatus  PaymentStatus?
+  changedByKey   String
+  notes          String?
+  createdAt      DateTime        @default(now())
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+}
+
+enum NotificationCategory {
+  NEW_ORDER
+  PAYMENT_CONFIRMED
+  SELLER_ORDER_UPDATE
+  DELIVERY_ASSIGNED
+  OUT_FOR_DELIVERY
+  DELIVERED
+  DELIVERY_FAILED
+  RETURN_REFUND_REQUEST
+  NEW_REVIEW
+  NEW_SERVICE_SUBMISSION
+  SERVICE_BOOKING
+  SYSTEM_ALERT
+}
+
+model Notification {
+  id         String               @id @default(uuid())
+  userId     String?
+  targetRole UserRole?
+  category   NotificationCategory
+  title      String
+  message    String
+  link       String?
+  metadata   Json?
+  isRead     Boolean              @default(false)
+  createdAt  DateTime             @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([targetRole])
+  @@index([isRead])
+  @@index([createdAt])
+}
+
+enum ServiceVerificationStatus {
+  DRAFT
+  PENDING_REVIEW
+  APPROVED_VERIFIED
+  REJECTED
+  SUSPENDED
+}
+
+enum ServiceBookingStatus {
+  PENDING
+  ACCEPTED
+  CONFIRMED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+  REJECTED
+}
+
+model Service {
+  id              String                    @id @default(uuid())
+  providerId      String
+  name            String
+  slug            String                    @unique
+  category        String
+  description     String
+  coverImage      String?
+  gallery         String[]                  @default([])
+  price           Float
+  pricingMethod   String                    @default("fixed")
+  durationMinutes Int                       @default(60)
+  serviceArea     String?
+  bookingInfo     String?
+  terms           String?
+  status          ServiceVerificationStatus @default(PENDING_REVIEW)
+  rejectionReason String?
+  rating          Float                     @default(5.0)
+  reviewCount     Int                       @default(0)
+  createdAt       DateTime                  @default(now())
+  updatedAt       DateTime                  @updatedAt
+
+  provider  User              @relation("ProviderServices", fields: [providerId], references: [id], onDelete: Cascade)
+  documents ServiceDocument[]
+  bookings  ServiceBooking[]
+  reviews   ServiceReview[]
+
+  @@index([status])
+  @@index([category])
+  @@index([providerId])
+}
+
+model ServiceDocument {
+  id        String   @id @default(uuid())
+  serviceId String
+  title     String
+  fileUrl   String
+  fileType  String?
+  createdAt DateTime @default(now())
+
+  service Service @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  @@index([serviceId])
+}
+
+model ServiceBooking {
+  id                 String               @id @default(uuid())
+  serviceId          String
+  customerKey        String
+  bookingNumber      String               @unique
+  appointmentDate    DateTime
+  timeSlot           String?
+  status             ServiceBookingStatus @default(PENDING)
+  notes              String?
+  contactPhone       String?
+  customerAddress    String?
+  price              Float?
+  paymentStatus      PaymentStatus        @default(PENDING)
+  cancellationReason String?
+  createdAt          DateTime             @default(now())
+  updatedAt          DateTime             @updatedAt
+
+  service Service        @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  reviews ServiceReview?
+
+  @@index([customerKey])
+  @@index([serviceId])
+  @@index([status])
+}
+
+model ServiceReview {
+  id        String   @id @default(uuid())
+  serviceId String
+  bookingId String?  @unique
+  ownerKey  String
+  rating    Int
+  comment   String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  service Service         @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  booking ServiceBooking? @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+
+  @@index([serviceId])
+  @@index([ownerKey])
+}
+
+
