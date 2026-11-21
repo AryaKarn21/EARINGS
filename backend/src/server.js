@@ -1,4 +1,11 @@
 require("dotenv").config();
+
+const DEFAULT_NEON_URL =
+  "postgresql://neondb_owner:npg_xP2dwOcoQTb8@ep-spring-moon-b5qaw68i.c-7.us-east-2.aws.neon.tech/neondb?sslmode=require";
+
+if (!process.env.DATABASE_URL) {
+  process.env.DATABASE_URL = DEFAULT_NEON_URL;
+}
 const express = require("express");
 const cors = require("cors");
 const morgan = require("morgan");
