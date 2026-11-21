@@ -3,7 +3,7 @@
  * directly — everything goes through here, so swapping REST for GraphQL, or
  * pointing at a different host, only touches this file.
  */
-const BASE = "/api";
+const BASE = import.meta.env.VITE_API_URL ? import.meta.env.VITE_API_URL.replace(/\/$/, "") : "/api";
 
 function getGuestId() {
   let id = localStorage.getItem("aurelie_guest_id");

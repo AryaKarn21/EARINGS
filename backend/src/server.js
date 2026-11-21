@@ -92,19 +92,21 @@ app.use((err, _req, res, _next) => {
 
 const PORT = process.env.PORT || 4000;
 
-connectDB().then(() => {
-  const server = app.listen(PORT, () => console.log(`Aurélie backend running on http://localhost:${PORT}`));
+if (require.main === module || !process.env.VERCEL) {
+  connectDB().then(() => {
+    const server = app.listen(PORT, () => console.log(`Aurélie backend running on http://localhost:${PORT}`));
 
-  // Prisma holds a real connection pool, so close it on shutdown rather than
-  // leaving sockets open for Postgres to time out.
-  for (const signal of ["SIGINT", "SIGTERM"]) {
-    process.on(signal, () => {
-      server.close(async () => {
-        await disconnectDB();
-        process.exit(0);
+    // Prisma holds a real connection pool, so close it on shutdown rather than
+    // leaving sockets open for Postgres to time out.
+    for (const signal of ["SIGINT", "SIGTERM"]) {
+      process.on(signal, () => {
+        server.close(async () => {
+          await disconnectDB();
+          process.exit(0);
+        });
       });
-    });
-  }
-});
+    }
+  });
+}
 
 module.exports = app;

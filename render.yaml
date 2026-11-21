@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: aurelie-earrings
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: cd backend && npm install && npx prisma generate && cd ../frontend && npm install && npm run build
+    startCommand: cd backend && npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: SEED_SUPER_ADMIN_EMAIL
+        value: admin@aurelie.local
+      - key: SEED_SUPER_ADMIN_PASSWORD
+        value: admin@123

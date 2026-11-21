@@ -3263,7 +3263,8 @@ export default function App() {
 
   // Verify DB live user role on app load
   useEffect(() => {
-    fetch("/api/health").then(r => r.ok ? setApiUp(true) : setApiUp(false)).catch(() => setApiUp(false));
+    const apiBase = import.meta.env.VITE_API_URL ? import.meta.env.VITE_API_URL.replace(/\/$/, "") : "/api";
+    fetch(`${apiBase}/health`).then(r => r.ok ? setApiUp(true) : setApiUp(false)).catch(() => setApiUp(false));
     refreshCart();
     refreshWishlist();
 
